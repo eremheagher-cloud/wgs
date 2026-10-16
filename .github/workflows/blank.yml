@@ -1,0 +1,342 @@
+
+name: PC virtual Eva
+
+on:
+  workflow_dispatch:
+    inputs:
+      instance_number:
+        description: "Numero da instancia"
+        required: true
+        default: "1"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  deploy-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Iniciar sessao
+        shell: pwsh
+        run: |
+          $Start = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+          "SESSION_START=$Start" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "Preparando Windows temporario."
+          Write-Host "Duracao maxima: 30 minutos."
+
+      - name: Baixar repositorio
+        uses: actions/checkout@v4
+
+      - name: Informacoes do Windows
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Write-Host "Nome solicitado: Eva"
+          Write-Host "Usuario: rafael"
+          Write-Host "Instancia: ${{ inputs.instance_number }}"
+          Get-ComputerInfo |
+            Select-Object WindowsProductName, WindowsVersion, OsArchitecture |
+            Format-List
+
+      - name: Criar usuario e gerar senha
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $Username = 'rafael'
+          $Rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+          $Bytes = New-Object byte[] 32
+
+          try {
+            $Rng.GetBytes($Bytes)
+            $RandomText = [Convert]::ToBase64String($Bytes)
+            $Password = 'Ra@' + $RandomText.Substring(0, 20) + '7!'
+            $SecurePassword = ConvertTo-SecureString $Password -AsPlainText -Force
+
+            $User = Get-LocalUser -Name $Username -ErrorAction SilentlyContinue
+
+            if ($null -eq $User) {
+              New-LocalUser -Name $Username -Password $SecurePassword `
+                -Description 'Conta temporaria Eva' | Out-Null
+            } else {
+              Set-LocalUser -Name $Username -Password $SecurePassword
+            }
+
+            $Group = Get-LocalGroup -SID 'S-1-5-32-555'
+            $Members = Get-LocalGroupMember -Group $Group.Name `
+              -ErrorAction SilentlyContinue
+
+            if (-not ($Members | Where-Object { $_.Name -match '\\rafael$' })) {
+              Add-LocalGroupMember -Group $Group.Name -Member $Username
+            }
+
+            "RDP_USERNAME=$Username" |
+              Out-File $env:GITHUB_ENV -Append -Encoding utf8
+            "RDP_PASSWORD=$Password" |
+              Out-File $env:GITHUB_ENV -Append -Encoding utf8
+
+            Write-Host "Usuario Windows configurado."
+            Write-Host "Senha gerada automaticamente."
+          } finally {
+            $SecurePassword = $null
+            $Password = $null
+            $Rng.Dispose()
+            [Array]::Clear($Bytes, 0, $Bytes.Length)
+          }
+
+      - name: Habilitar area de trabalho remota
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $Path = 'HKLM:\System\CurrentControlSet\Control\Terminal Server'
+
+          Set-ItemProperty -Path $Path -Name fDenyTSConnections -Value 0
+          Set-Service -Name TermService -StartupType Automatic
+          Start-Service -Name TermService
+
+          Get-NetFirewallRule -DisplayGroup 'Remote Desktop' `
+            -ErrorAction SilentlyContinue |
+            Enable-NetFirewallRule
+
+          if (-not (Get-NetFirewallRule -DisplayName 'RDP via Tailscale' `
+              -ErrorAction SilentlyContinue)) {
+            New-NetFirewallRule `
+              -DisplayName 'RDP via Tailscale' `
+              -Direction Inbound `
+              -Protocol TCP `
+              -LocalPort 3389 `
+              -RemoteAddress '100.64.0.0/10' `
+              -Action Allow `
+              -Profile Any | Out-Null
+          }
+
+          Write-Host "Configuracao RDP aplicada."
+
+      - name: Instalar Tailscale
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $Installer = Join-Path $env:TEMP 'tailscale.msi'
+          $Url = 'https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi'
+
+          try {
+            Invoke-WebRequest -Uri $Url -OutFile $Installer
+            $Process = Start-Process msiexec.exe `
+              -ArgumentList "/i `"$Installer`" /quiet /norestart" `
+              -Wait -PassThru
+
+            if ($Process.ExitCode -notin @(0, 3010)) {
+              throw "Falha na instalacao do Tailscale: $($Process.ExitCode)"
+            }
+          } finally {
+            if (Test-Path $Installer) {
+              Remove-Item $Installer -Force
+            }
+          }
+
+      - name: Autenticar e conectar Tailscale
+        shell: pwsh
+        env:
+          TAILSCALE_OAUTH_CLIENT_ID: ${{ secrets.TAILSCALE_OAUTH_CLIENT_ID }}
+          TAILSCALE_OAUTH_CLIENT_SECRET: ${{ secrets.TAILSCALE_OAUTH_CLIENT_SECRET }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ClientId = $env:TAILSCALE_OAUTH_CLIENT_ID
+          $ClientSecret = $env:TAILSCALE_OAUTH_CLIENT_SECRET
+          $Tag = 'tag:github-runner'
+          $TsExe = 'C:\Program Files\Tailscale\tailscale.exe'
+          $AuthKey = $null
+          $AccessToken = $null
+
+          try {
+            if ([string]::IsNullOrWhiteSpace($ClientId) -or
+                [string]::IsNullOrWhiteSpace($ClientSecret)) {
+              throw "Credenciais OAuth ausentes. Configure os dois segredos do Tailscale no GitHub."
+            }
+
+            if (-not (Test-Path $TsExe)) {
+              throw "Executavel do Tailscale nao encontrado."
+            }
+
+            $TokenResponse = Invoke-RestMethod `
+              -Method Post `
+              -Uri 'https://api.tailscale.com/api/v2/oauth/token' `
+              -ContentType 'application/x-www-form-urlencoded' `
+              -Body @{
+                grant_type = 'client_credentials'
+                client_id = $ClientId
+                client_secret = $ClientSecret
+                scope = 'auth_keys'
+              }
+
+            $AccessToken = $TokenResponse.access_token
+
+            if ([string]::IsNullOrWhiteSpace($AccessToken)) {
+              throw "A API nao retornou token OAuth."
+            }
+
+            $Headers = @{
+              Authorization = "Bearer $AccessToken"
+            }
+
+            $KeyBody = @{
+              capabilities = @{
+                devices = @{
+                  create = @{
+                    reusable = $false
+                    ephemeral = $true
+                    preauthorized = $true
+                    tags = @($Tag)
+                  }
+                }
+              }
+              expirySeconds = 3600
+            } | ConvertTo-Json -Depth 8
+
+            $KeyResponse = Invoke-RestMethod `
+              -Method Post `
+              -Uri 'https://api.tailscale.com/api/v2/tailnet/-/keys' `
+              -Headers $Headers `
+              -ContentType 'application/json' `
+              -Body $KeyBody
+
+            $AuthKey = $KeyResponse.key
+
+            if ([string]::IsNullOrWhiteSpace($AuthKey)) {
+              throw "A API nao retornou uma chave de autenticacao."
+            }
+
+            Write-Host "Chave temporaria obtida. Conectando..."
+
+            & $TsExe up "--auth-key=$AuthKey" '--hostname=Eva'
+            $ExitCode = $LASTEXITCODE
+
+            if ($ExitCode -ne 0) {
+              throw "Conexao recusada. Confira as permissoes OAuth e a tag $Tag."
+            }
+
+            Start-Sleep -Seconds 5
+            $IPOutput = & $TsExe ip -4
+
+            if ($LASTEXITCODE -ne 0) {
+              throw "Falha ao consultar o IP do Tailscale."
+            }
+
+            $TailscaleIP = ($IPOutput | Select-Object -First 1).Trim()
+
+            if ([string]::IsNullOrWhiteSpace($TailscaleIP)) {
+              throw "O Tailscale nao retornou um endereco IPv4."
+            }
+
+            "TAILSCALE_IP=$TailscaleIP" |
+              Out-File $env:GITHUB_ENV -Append -Encoding utf8
+
+            Write-Host "Tailscale conectado."
+            Write-Host "Endereco: $TailscaleIP"
+          } catch {
+            Write-Error "Falha no Tailscale: $($_.Exception.Message)"
+            throw
+          } finally {
+            $AuthKey = $null
+            $AccessToken = $null
+            $ClientSecret = $null
+            Remove-Item Env:TAILSCALE_OAUTH_CLIENT_SECRET `
+              -ErrorAction SilentlyContinue
+            Remove-Item Env:TAILSCALE_OAUTH_CLIENT_ID `
+              -ErrorAction SilentlyContinue
+          }
+
+      - name: Instalar Chrome
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $Installer = Join-Path $env:TEMP 'chrome_installer.exe'
+
+          try {
+            Invoke-WebRequest `
+              -Uri 'https://dl.google.com/chrome/install/latest/chrome_installer.exe' `
+              -OutFile $Installer
+
+            $Process = Start-Process $Installer `
+              -ArgumentList '/silent /install' -Wait -PassThru
+
+            if ($Process.ExitCode -notin @(0, 3010)) {
+              throw "Falha na instalacao do Chrome."
+            }
+          } finally {
+            if (Test-Path $Installer) {
+              Remove-Item $Installer -Force
+            }
+          }
+
+      - name: Instalar 7-Zip
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $Installer = Join-Path $env:TEMP '7zip-installer.exe'
+
+          try {
+            Invoke-WebRequest `
+              -Uri 'https://www.7-zip.org/a/7z2409-x64.exe' `
+              -OutFile $Installer
+
+            $Process = Start-Process $Installer `
+              -ArgumentList '/S' -Wait -PassThru
+
+            if ($Process.ExitCode -notin @(0, 3010)) {
+              throw "Falha na instalacao do 7-Zip."
+            }
+          } finally {
+            if (Test-Path $Installer) {
+              Remove-Item $Installer -Force
+            }
+          }
+
+      - name: Mostrar dados de conexao
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          Write-Host ""
+          Write-Host "========== DADOS DE CONEXAO =========="
+          Write-Host "Nome: Eva"
+          Write-Host "Endereco Tailscale: $env:TAILSCALE_IP"
+          Write-Host "Porta RDP: 3389"
+          Write-Host "Usuario: .\rafael"
+          Write-Host "Senha: $env:RDP_PASSWORD"
+          Write-Host "======================================"
+
+          @(
+            '## Dados de conexao'
+            ''
+            '- Nome: Eva'
+            "- Endereco Tailscale: $env:TAILSCALE_IP"
+            '- Porta RDP: 3389'
+            '- Usuario Windows: .\rafael'
+            "- Senha Windows: $env:RDP_PASSWORD"
+            ''
+            'Proteja estas credenciais.'
+            'O runner e temporario.'
+          ) | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
+      - name: Manter sessao por ate 29 minutos
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $Start = [DateTimeOffset]::FromUnixTimeSeconds(
+            [long]$env:SESSION_START
+          )
+          $Deadline = $Start.AddMinutes(29)
+
+          while ([DateTimeOffset]::UtcNow -lt $Deadline) {
+            $Remaining = ($Deadline - [DateTimeOffset]::UtcNow).TotalSeconds
+            if ($Remaining -le 0) { break }
+
+            Write-Host "Sessao ativa: $(Get-Date -Format 'HH:mm:ss')"
+            Start-Sleep -Seconds ([Math]::Min(30, [Math]::Ceiling($Remaining)))
+          }
+
+          Write-Host "Tempo de sessao concluido."
+          
